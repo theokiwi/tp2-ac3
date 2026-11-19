@@ -1,0 +1,4 @@
+PASS  uniforme RAM50% aging split_precision~0.50  (valor=0.518000)
+PASS  sequencial>RAM LRU exato hit_rate~0  (valor=0.0000)
+PASS  zipf0.99 RAM50% page_ins(OPT)<=page_ins(LRU,aging)  (valor=OPT=0 LRU=2121 AGING=2359)
+PASS  determinismo (policy,page_ins,split,lru_agree identicos)  (valor=chunkq,2144,0.524000,0.397388 vs chunkq,2144,0.524000,0.397388)
