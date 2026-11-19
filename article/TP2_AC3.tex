@@ -1,0 +1,271 @@
+\documentclass[12pt]{article}
+
+\usepackage{sbc-template}
+
+\usepackage{graphicx,url}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage[brazil]{babel}
+
+\sloppy
+
+\title{Qualidade da Previsão de Acesso à Memória na Migração de VMs com Memória Virtual Privada}
+
+\author{Bernardo A. B. Varges\inst{1}, Iara L. Publio\inst{1}, Gabriel H. P. Cavalhaes\inst{1}, \\
+Mateus F. V. R. de Castro\inst{1}, Theo D. Viana\inst{1}}
+
+\address{Instituto de Ciências Exatas e de Informática (ICEI)\\
+Pontifícia Universidade Católica de Minas Gerais (PUC Minas)\\
+Av. Dom José Gaspar, 500 -- 30.535-901 -- Belo Horizonte -- MG -- Brazil
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{resumo}
+A migração de uma VM para um host com menos memória do que ela exige decidir quais blocos ficam na RAM do destino e quais vão para um swap privado em SSD NVMe. O VMemDirect faz essa decisão com filas de blocos (\textit{chunk queues}) e afirma ser mais preciso que o \textit{aging} de 8 bits do S-memV, mas mede apenas o tempo de decisão, e não a precisão da previsão. Este trabalho propõe comparar as duas organizações de LRU aproximado, junto com LRU exato, OPT e CLOCK, em um simulador próprio dirigido por \textit{traces} sintéticos, sob mesmo \textit{trace}, mesma memória e mesmo período de amostragem, e medir quanto cada uma erra após a migração e de que essa diferença depende.
+\end{resumo}
+
+\section{Introdução}
+
+\subsection{Contexto, o Artigo-Base e a Lacuna}
+
+A migração ao vivo de máquinas virtuais (VMs) é uma operação básica de provedores de nuvem. O caso mais simples assume que o host de destino tem tanta memória quanto a VM, mas nem sempre é assim: o VMemDirect \cite{muraoka2023vmemdirect} trata o caso em que a VM é maior que a memória do destino. Parte da memória da VM fica na RAM do destino e o resto vai para um \textit{swap} privado em SSD NVMe. A viabilidade da técnica depende de uma decisão: quais blocos devem ficar na RAM. Se o sistema erra, o programa da VM acessa um bloco que está no \textit{swap}, acontece um \textit{page-in}, e cada busca no SSD custa ordens de grandeza mais que um acesso à RAM. Em um SSD como o usado em \cite{suetake2018smemv}, uma leitura de 4 KB leva cerca de 7,5 ms.
+
+Como não é possível prever o futuro, a decisão se apoia em uma aproximação do LRU (\textit{least recently used}), que mantém na RAM o que foi usado há menos tempo. O LRU exato exigiria registrar cada acesso, o que é caro demais, então os sistemas usam os bits de acesso (\textit{accessed bits}) que o hardware liga quando uma página é acessada e que o sistema consulta de tempos em tempos. O S-memV \cite{suetake2018smemv} guarda um histórico de 8 bits por página (\textit{aging}), e o histórico de um bloco de 256 páginas é o OU bit a bit dos históricos de suas páginas. O VMemDirect organiza blocos de 1 MB (256 páginas de 4 KB) em 256 filas, da menos recente para a mais recente. Um bloco acessado sai da fila $i$ e vai para o fim da fila $i+128$, e a cada envelhecimento as filas $2i-1$ e $2i$ viram a nova fila $i$. A vítima é o primeiro bloco da primeira fila não vazia.
+
+Os autores do VMemDirect afirmam que as filas são mais precisas que o \textit{aging} de 8 bits do S-memV, mas essa precisão nunca é medida. A avaliação do artigo mede o tempo de decisão da política (Figura 9) e, no restante, tempo de migração, \textit{downtime} e desempenho de aplicações. Nesses resultados a política se mistura com rede, SSD, paginação assíncrona e emulador de dispositivos, e não dá para saber quanto do ganho vem da previsão melhor e quanto vem do resto do sistema. Um exemplo mostra por que a afirmação é plausível, mas não está testada. Se dois blocos A e B são acessados no mesmo período, A no início e B no fim, o \textit{aging} grava \texttt{10000000} para os dois e não os distingue, enquanto um LRU exato sabe que B é o mais recente. Quanto mais blocos são acessados por período, mais empates o \textit{aging} tem.
+
+\subsection{Pergunta de Pesquisa, Hipóteses e Objetivos}
+
+Deste diagnóstico decorre a pergunta que orienta este trabalho:
+
+\begin{quote}
+Sob o mesmo \textit{trace}, a mesma memória e o mesmo período de amostragem, quanto a organização do LRU aproximado (\textit{aging} de 8 bits $\times$ \textit{chunk queues}) muda a qualidade da previsão de acesso após a migração, e de que essa diferença depende?
+\end{quote}
+
+Para respondê-la, formulam-se as seguintes hipóteses:
+
+\begin{description}
+\item[H1] As \textit{chunk queues} só geram menos \textit{page-ins} que o \textit{aging} quando muitos blocos são acessados por período de amostragem. Com poucos acessos por período, as duas políticas empatam.
+\item[H2] A vantagem de qualquer política sobre outra diminui conforme a fração da VM que cabe na RAM aumenta (25\%, 50\% e 75\%).
+\item[H3] Em varredura sequencial cíclica maior que a RAM, que é o \textit{benchmark} de memória do artigo-base, toda política baseada em LRU falha, e as \textit{chunk queues} não trazem ganho.
+\end{description}
+
+Os objetivos são: (i) implementar as políticas de forma comparável em um único simulador; (ii) medir \textit{page-ins} e precisão da previsão sob condições controladas; e (iii) verificar se a afirmação de ``maior precisão'' do artigo-base se sustenta, e em que condições.
+
+A contribuição é metodológica. O trabalho não propõe novo mecanismo de migração: ele submete a afirmação central de precisão do VMemDirect a uma comparação isolada, que a literatura analisada não faz, e identifica de quais variáveis (acessos por período, fração de RAM e padrão de acesso) a vantagem depende.
+
+\section{Trabalhos Correlatos}
+
+Selecionamos seis trabalhos. Dois são a base do estudo (VMemDirect e S-memV) e quatro tratam de migração de VMs, substituição de páginas e gerenciamento de memória em camadas. Os três mais recentes são de 2024 \cite{wu2024characterizing,negy2024ballooning,zhong2024managing}. O TPP \cite{maruf2023tpp} é anterior a esse recorte, mas entra por ser a referência de detecção de páginas quentes com estruturas do kernel.
+
+\subsection{VMemDirect e S-memV: as Bases}
+
+Hoje as nuvens oferecem VMs com muita memória (o VMemDirect cita até 24 TB na Amazon EC2, o S-memV até 3,9 TB), mas migrar uma VM dessas exige um host de destino que comporte toda a memória dela, e manter hosts assim reservados para migrações ocasionais não compensa. A memória virtual tradicional não resolve: durante a migração as páginas chegam em sequência e, assim que a RAM enche, cada página nova força uma \textit{page-out} sem relação com o uso real da VM; depois, dados ainda muito usados podem estar no disco. Nos testes do S-memV, isso fez a migração levar 11,7$\times$ mais tempo com HDD, com \textit{downtime} de até 30 s.
+
+Muraoka e Kourai \cite{muraoka2023vmemdirect} propõem a memória virtual privada: cada VM recebe RAM fixa e um \textit{swap} próprio em SSD NVMe, fora da área do emulador de dispositivos, com transferência direta — o host de origem já decide, por bloco de 1 MB, se o destino grava na RAM ou no \textit{swap}, sem paginação durante a migração. A previsão usa \textit{chunk queues}: 256 filas ($m=8$), da menos recente à mais recente; um bloco acessado sai da fila $i$ e vai para o fim da fila $i+2^{m-1}$, e a cada envelhecimento as filas $2i-1$ e $2i$ formam a nova fila $i$ (a metade de cima fica vazia). A vítima é o primeiro bloco da primeira fila não vazia. Com a VM ociosa, o VMemDirect foi de 8,3\% a 62\% mais rápido que a migração ingênua e ficou só 0,2\% a 6,9\% atrás da migração ideal, com \textit{downtime} de 454 a 896 ms a menos.
+
+O S-memV \cite{suetake2018smemv} resolve o mesmo problema com migração dividida (\textit{split migration}): a VM vai para um host principal, que recebe o núcleo da VM e as páginas com maior chance de acesso, e um ou mais sub-hosts recebem o resto, acessado depois por paginação remota via \textit{userfaultfd}. A previsão usa \textit{aging}: um histórico de 8 bits por página, com o bit de acesso da EPT acumulado no bit mais significativo a cada período e deslocado uma posição à direita; o histórico de um \textit{chunk} de 256 páginas é o OU bit a bit dos históricos de suas páginas, e a vítima é o \textit{chunk} de menor histórico. Comparado a escolha aleatória, o LRU deixou o \textit{sort} 5,7\% mais rápido e o \textit{memcached} recuperou a vazão 10$\times$ mais rápido.
+
+A fragilidade comum, e o ponto que este trabalho ataca, é que o VMemDirect afirma que as \textit{chunk queues} são mais precisas que o \textit{aging} de 8 bits, mas essa precisão nunca é medida isoladamente: a Figura 9 do artigo-base mede só tempo de decisão, e o restante da avaliação mede tempo de migração, \textit{downtime} e desempenho de aplicações, em que a política se mistura com rede, SSD e paginação assíncrona. O S-memV, por sua vez, compara o \textit{aging} só com escolha aleatória, nunca com outro aproximador de LRU, então não se sabe quão bom o \textit{aging} é em si. Nenhum dos dois informa o período de amostragem, e o VMemDirect deixa em aberto o destino de um bloco da fila 200, que iria para a fila 328 em um sistema que só tem 256 — neste trabalho, esse destino é limitado à fila 256, e os períodos são tratados como parâmetros. Vale notar ainda que o histórico do S-memV é por página, e só o do \textit{chunk} é derivado por OU; um \textit{chunk} com poucas páginas muito acessadas tende a valores altos, o que pode agravar os empates que o VMemDirect critica — uma hipótese nossa, ainda não verificada pelos autores de nenhum dos dois artigos.
+
+\subsection{Demais Trabalhos}
+
+Wu et al. \cite{wu2024characterizing} comparam o MG-LRU com o CLOCK em cargas de 12 a 16 GB (TPC-H, PageRank, YCSB/Memcached), com \textit{swap} em SSD e ZRAM. Na média o MG-LRU empata ou vence, mas com 75\%--90\% de memória o CLOCK chega a vencer por 2\%--5\%, o que motiva H2 e H3: a qualidade de uma política depende da fração de memória disponível e da carga. A diferença para nós é que eles medem tempo de execução em sistema real, em que custo de varredura e qualidade de decisão se confundem; nós isolamos a decisão em simulador.
+
+Negy et al. \cite{negy2024ballooning} atacam a migração por outro lado: reduzem continuamente a memória da VM antes de migrar, com \textit{ballooning} controlado por um agente em espaço de usuário, cortando o tempo de migração em até 89\%. É complementar a este trabalho, mas pressupõe um host sem sobrealocação e não resolve o caso em que o destino tem menos RAM que a VM — aí a qualidade da previsão volta a decidir o custo.
+
+Maruf et al. \cite{maruf2023tpp} propõem o TPP, que mantém páginas quentes na memória local e rebaixa as frias para CXL usando listas LRU do Linux, só promovendo uma página se ela estiver na lista ativa (evitando \textit{ping-pong}). É relevante por mostrar que estruturas simples de LRU bastam para separar quente de frio, e que a promoção precisa de histerese; reforça também a limitação que assumimos, de ver só bits de acesso por período, sem contagem. Porém sua avaliação é em produção na Meta com NUMA emulando CXL, não comparável a uma política de migração.
+
+Zhong et al. \cite{zhong2024managing} tratam memória em camadas em VMs com CXL: o Memstrata usa \textit{page coloring} e um modelo \textit{Random Forest} para redistribuir memória a VMs sofrendo, reduzindo a lentidão de piores casos de mais de 30\% para menos de 6\%, enquanto o TPP por software causou lentidão acima de 50\% em 17\% das cargas. Um resultado notável é que escolher páginas por popularidade (DAMON) teve custo maior que o benefício, e os autores preferiram aleatoriedade — o que motiva medir o tempo de decisão como métrica secundária neste trabalho. A limitação é a escala reduzida (seis VMs, protótipo pré-produção).
+
+\subsection{Posicionamento da Proposta}
+
+Os trabalhos analisados avaliam a política de previsão como parte de um sistema completo, medindo tempo de execução, tempo de migração ou \textit{slowdown}, e por isso não separam a qualidade da previsão do resto; cada um ainda usa plataforma, cargas e \textit{baseline} próprios. Este trabalho não propõe novo mecanismo: sua contribuição é uma comparação controlada, com mesmo \textit{trace} para todas as políticas, que mede a qualidade da previsão diretamente e identifica de que variáveis ela depende.
+
+\section{Metodologia}
+
+Usamos simulação por três razões. A primeira é que o \textit{testbed} do artigo-base (três servidores, rede de 10 GbE, NVMe e VMs de até 240 GB) não está disponível para o grupo. A segunda é o isolamento de variáveis: em um sistema real, rede, SSD e paginação assíncrona se misturariam com a política, impedindo atribuir diferenças à previsão. A terceira é a varredura paramétrica (fração de RAM, acessos por período, padrão de acesso), que seria inviável em sistema real. A simulação dirigida por \textit{trace} também submete todas as políticas à mesma sequência de acessos, de modo que a variação nas métricas venha só da política.
+
+\subsection{Fases do Experimento}
+
+O simulador é dirigido por \textit{traces} sintéticos de acesso a blocos de 1 MB (256 páginas de 4 KB). Ele não aloca a memória da VM e guarda apenas o estado de cada bloco. Cada execução tem três fases:
+
+\begin{enumerate}
+\item \textbf{Antes da migração.} A VM executa o \textit{trace} no host de origem. As políticas veem apenas os bits de acesso por período de amostragem.
+\item \textbf{Migração.} Os X\% de blocos mais quentes segundo a política vão para a RAM do destino, e o resto vai para o \textit{swap}.
+\item \textbf{Depois da migração.} O \textit{trace} continua. Um acesso a bloco no \textit{swap} gera \textit{page-in}, e a política escolhe a vítima que sai da RAM.
+\end{enumerate}
+
+Por exemplo, uma VM de 16 GB tem 16.384 blocos. Com RAM de 50\%, 8.192 blocos vão para a RAM. Se logo após a migração 1.000 blocos distintos forem usados e 900 estiverem na RAM, a divisão acertou 90\% e os outros 100 viram \textit{page-ins}.
+
+Ficam fora do escopo, e são justificados aqui: migração real com QEMU-KVM, tempo de migração e \textit{downtime} (dependem de rede e SSD), paginação assíncrona e latência do SSD (medimos quantas páginas são buscadas, não quanto tempo leva) e \textit{split migration} (exige vários hosts).
+
+\subsection{Políticas Comparadas}
+
+\begin{table}[h]
+\centering
+\caption{Políticas comparadas.}
+\label{tab:politicas}
+\begin{tabular}{ll}
+\toprule
+Política & Papel \\
+\midrule
+OPT (Belady) & Limite inferior de \textit{page-ins} (conhece o futuro) \\
+LRU exato & O que o LRU aproximado tenta imitar \\
+\textit{Aging} de 8 bits & Política do S-memV \cite{suetake2018smemv} \\
+\textit{Chunk queues} & Política do VMemDirect \cite{muraoka2023vmemdirect} \\
+CLOCK & Aproximação clássica de LRU \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+As duas políticas aproximadas recebem exatamente a mesma informação (bits de acesso por período), e o que as diferencia é como organizam o histórico. Como o \textit{trace} é por bloco e os históricos das páginas de um bloco são deslocados juntos, o OU dos históricos do S-memV equivale a um histórico de 8 bits por bloco em que o bit é ligado se qualquer página do bloco foi acessada no período, e é assim que o \textit{aging} é modelado. Para as ambiguidades do artigo-base, adotamos limitar a fila de destino à fila 256 e tratar os períodos de amostragem e de envelhecimento como parâmetros, registrando as decisões no repositório. O MGLRU simplificado, cogitado como política opcional no plano de trabalho, foi cortado do escopo desta etapa para priorizar a bateria completa das cinco políticas principais sob todas as cargas e frações de RAM, conforme a ordem de corte definida no planejamento.
+
+\subsection{Cargas de Trabalho}
+
+São cinco cargas sintéticas, cada uma imitando o padrão de um \textit{benchmark} ou cenário do artigo-base e da literatura (Tabela \ref{tab:cargas}).
+
+\begin{table}[h]
+\centering
+\caption{Cargas de trabalho sintéticas.}
+\label{tab:cargas}
+\begin{tabular}{ll}
+\toprule
+Carga & O que imita \\
+\midrule
+Sequencial cíclica & \textit{Benchmark} de memória do artigo-base (Fig. 7) \\
+Zipf ($\alpha=0{,}8$ / $0{,}99$ / $1{,}2$) & Memcached com YCSB (Fig. 8) \\
+Uniforme & Pior caso para qualquer previsão \\
+Mudança de fase & Conjunto de trabalho que muda ao longo do tempo \\
+Rajadas & Muitos blocos acessados por período \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+O uso de \textit{traces} sintéticos permite controlar diretamente o número de acessos por período (H1), mas é uma limitação: os padrões imitam as cargas, e não as reproduzem.
+
+\subsection{Parâmetros}
+
+\begin{table}[h]
+\centering
+\caption{Parâmetros do experimento.}
+\label{tab:parametros}
+\begin{tabular}{ll}
+\toprule
+Parâmetro & Valores \\
+\midrule
+Tamanho da VM & 16 GB (base); 240 GB (escala) \\
+Bloco & 256 páginas de 4 KB = 1 MB \\
+Fração de RAM & 25\%, 50\%, 75\% \\
+Filas & 256 ($m=8$) \\
+Bits do \textit{aging} & 8 \\
+Período de amostragem & A definir (não informado no artigo-base) \\
+Sementes & 5 por carga aleatória \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Variáveis e Métricas}
+
+\textbf{Independentes.} Política; carga de trabalho; fração de RAM; acessos por período de amostragem; tamanho da VM.
+
+\textbf{Dependentes.} A métrica principal é o número de \textit{page-ins} após a migração, também normalizado pelo número de \textit{page-ins} do OPT. Como métricas de apoio: a precisão da divisão (fração dos blocos acessados logo após a migração que já estavam na RAM); a concordância com o LRU (fração das vítimas que o LRU exato também escolheria); e, como métrica secundária, o tempo de decisão, sempre medido na mesma máquina.
+
+\textbf{Verificações de sanidade.} Se algum caso da Tabela \ref{tab:sanidade} não bater, há erro no simulador.
+
+\begin{table}[h]
+\centering
+\caption{Verificações de sanidade do simulador.}
+\label{tab:sanidade}
+\begin{tabular}{ll}
+\toprule
+Caso & Resultado esperado \\
+\midrule
+Carga uniforme, RAM de 50\% & $\approx$ 50\% de acerto em qualquer política \\
+Sequencial cíclica $>$ RAM, LRU exato & $\approx$ 0\% de acerto após o aquecimento \\
+Qualquer carga & \textit{Page-ins} do OPT $\leq$ \textit{page-ins} das demais \\
+Mesmo \textit{trace} e mesma semente & Resultado idêntico entre execuções \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Estratégia de Análise}
+
+O desenho é fatorial completo. H1 é decidida comparando \textit{chunk queues} e \textit{aging} ao variar os acessos por período: se a diferença só aparece com muitos acessos por período, a hipótese se confirma. H2 sai da diferença entre políticas nas três frações de RAM, e H3 da carga sequencial cíclica maior que a RAM, em que esperamos $\approx$ 0\% de acerto em todas as políticas baseadas em LRU. Para cada carga aleatória, foram usadas cinco sementes, e reportamos média e desvio padrão. Cada hipótese tem um gráfico e um veredito.
+
+\section{Ambiente Experimental}
+
+O simulador foi implementado em C, compilado com GCC 15.2.0 (\texttt{-O2}), e executado em um único processo, sem paralelismo, em uma máquina Linux (kernel 6.18, x86\_64) do grupo. Cada combinação de política, carga, fração de RAM e densidade de período roda como um processo independente que lê um \textit{trace} binário e imprime uma linha de métricas; a bateria completa é orquestrada por um script \textit{shell} único.
+
+\subsection{Representação e Implementação}
+
+O \textit{trace} é um fluxo binário de identificadores de bloco (\texttt{uint32\_t}), gerado uma vez por carga e semente e reutilizado por todas as políticas, frações de RAM e densidades de período -- exatamente a mesma sequência de acessos é submetida a todas as políticas, como a Metodologia exige. O simulador mantém apenas o estado por bloco (até 256 filas, 8 bits de \textit{aging}, carimbo de LRU, ou \textit{bit} de referência do CLOCK), nunca o conteúdo da VM; para os 16.384 blocos da VM base (16 GB), isso ocupa poucos megabytes de RAM do processo, confirmando a estimativa do plano de trabalho.
+
+As políticas \textit{aging} e \textit{chunk queues} só recebem bits de acesso agregados por período de amostragem, enquanto LRU exato, OPT e CLOCK operam sobre o fluxo de acessos bruto -- essa é a diferença de informação que a Metodologia já descreve entre as duas políticas aproximadas e as demais. O OPT usa a técnica clássica de Belady: uma passada única, de trás para frente, sobre o trecho pós-migração computa a próxima ocorrência de cada bloco em tempo $O(1)$ por acesso, evitando recalcular distâncias a cada decisão. A vítima das políticas \textit{aging} e \textit{chunk queues} é desempatada por ordem crescente de identificador de bloco, uma escolha determinística e documentada, mas arbitrária; o artigo-base não especifica desempate.
+
+\subsection{Parâmetros Concretos da Bateria}
+
+A VM base tem 16.384 blocos (16 GB). Cada execução tem 30 períodos de aquecimento antes da migração e 20.000 acessos na fase pós-migração. A densidade de acessos por período (variável manipulada de H1) tem três níveis: esparso (200 acessos/período, $\approx$1,2\% da VM), médio (2.000, $\approx$12\%) e denso (9.000, $\approx$55\%, com reacessos). Cada \textit{trace} tem 300.000 acessos, suficiente para cobrir o aquecimento mais longo (denso) mais a fase pós-migração. Rodam cinco políticas, sete configurações de carga (sequencial cíclica; Zipf com $\alpha\in\{0{,}8;\,0{,}99;\,1{,}2\}$; uniforme; mudança de fase; rajadas), cinco sementes por carga aleatória, três frações de RAM e três densidades de período -- uma bateria fatorial completa.
+
+\subsection{Reprodutibilidade}
+
+O repositório contém o simulador (\texttt{sim/src}), o gerador de \textit{traces}, o script único \texttt{sim/scripts/run\_all.sh} que recompila, regenera os \textit{traces}, roda as quatro verificações de sanidade e só então a bateria completa, interrompendo-se se qualquer verificação falhar. O resultado é um único CSV (\texttt{sim/results/battery.csv}) em que cada linha guarda, além das métricas, o comando exato que a reproduz. As sementes são fixas (1001--1005); o mesmo \textit{trace} e a mesma semente produzem resultado idêntico entre execuções, conferido como verificação de sanidade.
+
+Para confirmar a estimativa de memória do artigo-base também na escala maior, rodamos uma verificação isolada com uma VM de 240 GB (245.760 blocos): o processo do simulador usou 8,1 MB de memória residente (\texttt{VmRSS}, amostrado durante a execução), muito próximo da estimativa de $\approx$8 MB do plano de trabalho e muitas ordens de grandeza abaixo dos 240 GB da VM simulada, confirmando que o simulador não aloca a memória da VM em nenhuma escala testada.
+
+\section{Resultados}
+
+A bateria completa gerou 1.395 execuções (1 sequencial determinística + 1.394 combinações com carga aleatória), todas após as quatro verificações de sanidade passarem (Tabela \ref{tab:sanidade}): divisão $\approx$50\% de acerto sob carga uniforme com RAM de 50\% (0,518); $\approx$0\% de acerto do LRU exato na carga sequencial maior que a RAM (0,0000); \textit{page-ins} do OPT sempre $\leq$ das demais políticas; e resultado idêntico entre duas execuções com mesmo \textit{trace}, semente e política.
+
+\begin{figure}[htb]
+\centering
+\begin{minipage}{0.325\linewidth}\centering\includegraphics[width=\linewidth]{figs/fig_h1.png}\end{minipage}\hfill
+\begin{minipage}{0.325\linewidth}\centering\includegraphics[width=\linewidth]{figs/fig_h2.png}\end{minipage}\hfill
+\begin{minipage}{0.325\linewidth}\centering\includegraphics[width=\linewidth]{figs/fig_h3.png}\end{minipage}
+\caption{Da esquerda para a direita: H1 (\textit{aging} $\times$ \textit{chunk queues} por densidade de acessos/período, RAM 50\%, média de todas as cargas aleatórias); H2 (\textit{page-ins} médios de todas as políticas nas três frações de RAM, todas as cargas); H3 (taxa de acerto na carga sequencial cíclica, VM $>$ RAM).}
+\label{fig:resultados}
+\end{figure}
+
+\textbf{H1.} Com RAM de 50\% e média sobre todas as cargas aleatórias, a diferença entre \textit{chunk queues} e \textit{aging} é de 0,48\% no regime esparso (200 acessos/período), 0,71\% no médio (2.000) e 0,14\% no denso (9.000) -- sem tendência crescente com a densidade, e sempre dentro do desvio padrão de ambas as políticas (Figura \ref{fig:resultados}, painel 1). O mesmo padrão se repete nas três frações de RAM: 0,25\%, 0,44\% e 0,74\% de diferença em 25\%, 50\% e 75\% de RAM, respectivamente. A concordância média com o LRU exato também é praticamente idêntica entre as duas (\textit{aging} 14,85\%, \textit{chunk queues} 14,80\%), e a precisão da divisão da migração também (60,9\% \textit{vs.} 60,6\%).
+
+\textbf{H2.} Em \textit{page-ins} absolutos, o intervalo entre a melhor e a pior política (excluído o OPT) é de 448 \textit{page-ins} com RAM de 25\%, cai para 95 com RAM de 50\% e volta a 147 com RAM de 75\% -- não há queda monotônica. Quando normalizado pelo OPT, o afastamento das políticas aproximadas cresce com a fração de RAM (de $\approx$2,5$\times$--2,7$\times$ o OPT em 25\% para 14,8$\times$--16,5$\times$ em 75\%), mas isso reflete sobretudo a queda abrupta do próprio OPT (de 2.352 para 132 \textit{page-ins} médios), não um afastamento real entre as políticas aproximadas entre si.
+
+\textbf{H3.} Na carga sequencial cíclica maior que a RAM, o LRU exato e o CLOCK colapsam quase sempre a 0\% de acerto (0\% em 7 das 9 combinações carga$\times$RAM testadas), confirmando a previsão de H3 para essas duas políticas. Já \textit{aging} e \textit{chunk queues} sustentam taxas de acerto bem acima de zero em todas as frações de RAM -- em média 13,6\% (RAM 25\%), 31,9\% (RAM 50\%) e 60,6\% (RAM 75\%) -- e seguem empatadas entre si em cada execução (diferença $\leq$0,1 p.p.). O OPT atinge 38,6\%, 59,0\% e 79,5\% nas mesmas condições.
+
+O tempo de decisão médio por política, da mais rápida à mais lenta, é CLOCK (0,73 ms) $<$ OPT (4,44 ms) $<$ \textit{chunk queues} (85,49 ms) $<$ \textit{aging} (87,32 ms) $<$ LRU exato (126,31 ms); \textit{chunk queues} decide 2,1\% mais rápido que \textit{aging}, na mesma direção afirmada pelo artigo-base, embora a diferença seja pequena nesta implementação.
+
+\section{Discussão}
+
+O resultado central é que H1, como formulada, não se sustenta: a vantagem de precisão das \textit{chunk queues} sobre o \textit{aging} de 8 bits não aparece em nenhuma densidade de acessos testada, nem mesmo na mais densa, onde a Introdução previa que o \textit{aging} acumularia mais empates. Isso tem uma explicação estrutural, não só estatística. Neste simulador, o sinal que ambas as políticas recebem por período é binário por bloco -- ``o bloco foi tocado neste período?'' -- porque o \textit{trace} é por bloco (Seção 3.2) e não por página. Sob esse sinal, o histórico de \textit{aging} de 8 bits tem exatamente $2^8=256$ valores possíveis, o mesmo número das 256 \textit{chunk queues}; as duas estruturas só diferem em como mapeiam uma sequência de bits para uma posição entre 256, e com o mesmo desempate (menor índice de bloco) e a mesma regra de vítima (mínimo valor/fila), a ordenação resultante tende a coincidir. O exemplo da Introdução -- blocos A e B empatados no \textit{aging} apesar de ordens de acesso diferentes -- é real, mas sob este sinal binário por bloco as \textit{chunk queues} caem no mesmo tipo de empate, porque ambas colapsam qualquer acesso dentro do período na mesma informação de 1 bit. A maior resolução das \textit{chunk queues} só teria chance de aparecer se o sinal de entrada já distinguisse múltiplos acessos no mesmo período (por exemplo, contagem, ou bits por página dentro do bloco) -- o que nem o artigo-base nem este trabalho implementam.
+
+H2 não se confirma de forma limpa. O afastamento absoluto entre políticas aproximadas não cai monotonicamente com a fração de RAM (cresce de 25\% para 75\% depois de cair para 50\%), e o afastamento normalizado pelo OPT cresce porque o próprio OPT se aproxima de zero \textit{page-ins} em frações de RAM altas -- um artefato da normalização, não evidência de que as políticas aproximadas se aproximem ou se distanciem umas das outras. O dado mais robusto é justamente a ausência de variação: \textit{aging} e \textit{chunk queues} permanecem com diferença abaixo de 1\% nas três frações de RAM testadas.
+
+H3 só se confirma parcialmente, e o detalhe que ela erra é o mais interessante do trabalho. ``Toda política baseada em LRU falha'' é verdade para o LRU exato e para o CLOCK, que sofrem o efeito clássico de \textit{sequential flooding}: como cada bloco é acessado exatamente uma vez por volta do ciclo, a ordem de recência exata garante que o bloco prestes a ser reacessado é sempre o escolhido como vítima. Mas \textit{aging} e \textit{chunk queues} não sofrem o mesmo colapso, porque não mantêm ordem de recência exata -- apenas um retrato por período, atualizado em lotes. Esse retrato grosseiro, paradoxalmente, preserva memória de mais de um ciclo de acessos e evita o pior caso do LRU estrito. O resultado é que, embora nenhuma política aproximada alcance o OPT, \textit{aging} e \textit{chunk queues} entregam de 2 a 6 vezes mais acerto que o LRU exato na mesma carga -- uma vantagem real, mas que vem da amostragem periódica, e não das \textit{chunk queues} especificamente, já que o \textit{aging} se beneficia igualmente.
+
+\textbf{Limitações.} A simplificação por bloco (Seção 3.2), necessária para tornar o \textit{trace} comparável entre políticas, é também a provável causa de H1 não se confirmar: ela remove justamente a informação (qual página dentro do bloco, quantos acessos) que poderia separar \textit{aging} de \textit{chunk queues}. A métrica de concordância com o LRU produziu um valor degenerado para o OPT ($-$0,75, fora da faixa [0,1]), porque o OPT não ordena por recência e a métrica assume que todas as políticas o fazem; o número foi registrado mas não interpretado para o OPT. As cargas continuam sintéticas, e o desempate determinístico por menor índice de bloco, embora documentado, é uma escolha arbitrária que pode ter contribuído para o empate observado entre \textit{aging} e \textit{chunk queues}.
+
+\section{Conclusões}
+
+Sob mesmo \textit{trace}, mesma memória e mesmo período de amostragem, a organização do LRU aproximado não mudou a qualidade da previsão de acesso após a migração nas condições testadas: \textit{chunk queues} e \textit{aging} de 8 bits produziram \textit{page-ins}, concordância com o LRU exato e precisão de divisão estatisticamente indistinguíveis em todas as três densidades de período e nas três frações de RAM, com diferenças sempre abaixo de 1\%. A afirmação do VMemDirect de que as \textit{chunk queues} são ``mais precisas'' que o \textit{aging} do S-memV, que o artigo nunca mediu isoladamente, não se sustenta sob a comparação isolada que este trabalho propôs -- pelo menos quando ambas as políticas recebem o mesmo sinal binário por bloco e por período. O único lugar em que as \textit{chunk queues} levaram alguma vantagem foi no tempo de decisão (2,1\% mais rápidas que o \textit{aging}), replicando a direção do resultado original do artigo-base, mas não sua magnitude nem sua interpretação como ``precisão''.
+
+Das três hipóteses: H1 é refutada pelos dados -- a densidade de acessos por período não produz a vantagem prevista para as \textit{chunk queues} em nenhum nível testado. H2 não se confirma de forma conclusiva -- o afastamento absoluto entre políticas não cai de forma monotônica com a fração de RAM, embora a diferença \textit{aging}--\textit{chunk queues} especificamente permaneça pequena e estável. H3 se confirma parcialmente: LRU exato e CLOCK de fato falham quase totalmente na carga sequencial maior que a RAM, mas \textit{aging} e \textit{chunk queues} resistem parcialmente ao mesmo cenário, por um motivo que não é exclusivo das \textit{chunk queues} -- a amostragem periódica em lote, e não a estrutura de filas.
+
+A contribuição deste trabalho não é um novo mecanismo, mas uma medição isolada que faltava na literatura: ela mostra que, quando isolada de rede, SSD e paginação assíncrona, a vantagem de precisão central do VMemDirect não é automática, e que depende de uma premissa -- um sinal de acesso com granularidade suficiente para diferenciar as duas organizações -- que nem o artigo-base nem o S-memV tornam explícita.
+
+\section{Trabalhos Futuros}
+
+Primeiro, repetir H1 com um \textit{trace} por página (não por bloco), preservando contagens de acesso dentro do período, para testar diretamente a hipótese estrutural levantada na Discussão: que o empate observado é um efeito da simplificação por bloco, e não uma propriedade geral das duas políticas. Segundo, variar o desempate determinístico (menor índice de bloco) por aleatório ou por round-robin, para medir se o empate de H1 é sensível a essa escolha. Terceiro, rodar a bateria fatorial completa também na escala de 240 GB (este trabalho validou apenas o footprint de memória nessa escala, não repetiu as três hipóteses). Por fim, validar os achados mais surpreendentes -- a resistência de \textit{aging} e \textit{chunk queues} ao \textit{sequential flooding} que derruba o LRU exato -- em um ambiente real com QEMU-KVM, onde paginação assíncrona e concorrência podem alterar a vantagem observada aqui em simulação isolada.
+
+\section*{Declaração de Uso de Inteligência Artificial}
+
+Ferramentas de inteligência artificial generativa, especificamente o Claude (Anthropic), foram utilizadas como apoio à estruturação, à execução dos experimentos e à revisão do texto. Os autores revisaram e validaram todo o conteúdo produzido com auxílio dessas ferramentas e permanecem integralmente responsáveis pelo conteúdo final do manuscrito.
+
+\bibliographystyle{sbc}
+\bibliography{refs}
+
+\end{document}
